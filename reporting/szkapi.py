@@ -90,16 +90,22 @@ class SzkApi(object):
                 sys.exit(0)
 
     def set_headers(self):
-        self.headers = {'api-key': self.api_key}
+        self.headers = {'api-key': self.api_key,
+                        'Content-Type': 'application/json'}
         data = {'username': self.username, 'password': self.password}
-        r = self.make_request(
-            self.login_url, method='POST', data=json.dumps(data),
-            headers=self.headers)
-        if 'result' not in r.json():
-            logging.warning('Could not set headers with error as follows: '
-                            '{}'.format(r.json()))
-        session_id = r.json()['result']['sessionId']
-        self.headers['Authorization'] = session_id
+        for i in range(1, 10):
+            r = self.make_request(
+                self.login_url, method='POST', data=json.dumps(data),
+                headers=self.headers)
+            if 'result' in r.json() and 'sessionId' in r.json()['result']:
+                session_id = r.json()['result']['sessionId']
+                self.headers['Authorization'] = session_id
+                return True
+            else:
+                logging.warning(
+                    'Could not set headers with error as follows, retrying:'
+                    '{}'.format(r.json()))
+        return False
 
     def make_request(self, url, method, headers=None, json_body=None, data=None,
                      attempt=1):
@@ -179,6 +185,7 @@ class SzkApi(object):
             sd = ed - dt.timedelta(days=1)
         sd = '{}{}'.format(sd.isoformat(), '.000Z')
         ed = '{}{}'.format(ed.isoformat(), '.000Z')
+        ed = ed.replace('T00:00:00.000Z', 'T23:59:59.000Z')
         return sd, ed
 
     def get_data_default_check(self, sd, ed, fields):
@@ -194,6 +201,10 @@ class SzkApi(object):
 
     def get_data(self, sd=None, ed=None, fields=None):
         fields = self.get_data_default_check(sd, ed, fields)
+        response = self.set_headers()
+        if not response:
+            logging.warning('Could not retrieve data. Returning empty dataframe')
+            return pd.DataFrame(data={})
         report_get_url = self.request_report(sd, ed, fields)
         report_dl_url = self.get_report_dl_url(report_get_url)
         self.df = self.download_report_to_df(report_dl_url)
@@ -201,7 +212,6 @@ class SzkApi(object):
 
     def request_report(self, sd, ed, fields):
         logging.info('Requesting report for {} to {}.'.format(sd, ed))
-        self.set_headers()
         report = self.create_report_body(fields)
         r = self.make_request(
             self.report_url, method='POST', headers=self.headers,
@@ -227,7 +237,8 @@ class SzkApi(object):
             r = self.make_request(url, method='GET', headers=self.headers)
             logging.info('Checking report.  Attempt: {} \n'
                          'Response: {}'.format(attempt + 1, r.json()))
-            if r.json()['result']['executionStatus'] == 'FINISHED':
+            result = r.json()['result']
+            if result and result['executionStatus'] == 'FINISHED':
                 logging.info('Report has been generated.')
                 report_dl_url = r.json()['result']['files']
                 if report_dl_url:
@@ -238,6 +249,9 @@ class SzkApi(object):
                     r = self.make_request(url, method='GET',
                                           headers=self.headers)
                     report_dl_url = r.json()['result'][0]['link']
+                break
+            elif not result:
+                logging.warning('No result, returning blank.')
                 break
             elif 'fault' in r.json():
                 logging.warning('Fault in response: {}'.format(r.json()))

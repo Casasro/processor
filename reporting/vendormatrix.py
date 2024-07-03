@@ -33,6 +33,7 @@ class VendorMatrix(object):
         self.vks = {
             vmc.api_fb_key: [],
             vmc.api_aw_key: [],
+            vmc.api_goad_key: [],
             vmc.api_tw_key: [],
             vmc.api_ttd_key: [],
             vmc.api_ga_key: [],
@@ -43,6 +44,7 @@ class VendorMatrix(object):
             vmc.api_dc_key: [],
             vmc.api_rs_key: [],
             vmc.api_db_key: [],
+            vmc.api_dvo_key: [],
             vmc.api_vk_key: [],
             vmc.api_rc_key: [],
             vmc.api_szk_key: [],
@@ -61,11 +63,16 @@ class VendorMatrix(object):
             vmc.api_amd_key: [],
             vmc.api_ss_key: [],
             vmc.api_nz_key: [],
-            vmc.api_ytd_key: []
+            vmc.api_ytd_key: [],
+            vmc.api_wal_key: [],
+            vmc.api_sim_key: [],
+            vmc.api_azu_key: [],
+            vmc.api_pix_key: []
         }
         self.ftp_sz_key = []
         self.db_dna_key = []
         self.s3_dna_key = []
+        self.azu_dna_key = []
         self.vm_rules_dict = {}
         self.ven_param = None
         self.plan_omit_list = None
@@ -137,6 +144,9 @@ class VendorMatrix(object):
             if vk_split[vk][0] == 'S3':
                 if vk_split[vk][1] == 'DNA':
                     self.s3_dna_key.append(vk)
+            if vk_split[vk][0] == 'AZU':
+                if vk_split[vk][1] == 'DNA':
+                    self.azu_dna_key.append(vk)
 
     def vm_rules(self):
         for key in self.vm:
@@ -374,8 +384,11 @@ class ImportConfig(object):
                     return None
             else:
                 return None
+        kwargs = {}
+        if file_library == yaml:
+            kwargs['Loader'] = yaml.FullLoader
         with open(file_name, 'r') as f:
-            config_file = file_library.load(f)
+            config_file = file_library.load(f, **kwargs)
         return config_file
 
     def make_new_json(self, params, new_file, account_id, import_filter=None,
@@ -761,6 +774,7 @@ class DataSource(object):
             for col in vmc.datafloatcol:
                 self.p[col + vmc.planned_suffix] = self.p[col]
                 float_cols.append(col + vmc.planned_suffix)
+                self.p[col] = 0
         else:
             float_cols = vmc.datafloatcol
         df = combining_data(df, self.key, float_cols, **self.p)
@@ -988,10 +1002,16 @@ def df_single_transform(df, transform):
         tc.read(dctc.filename_tran_config)
         df = tc.apply_translation_to_dict(df)
     if transform_type == 'AddColumn':
+        if len(transform) < 3:
+            logging.warning('Not formed correctly: {}'.format(transform))
+            return df
         col_name = transform[1]
         col_val = transform[2]
         df[col_name] = col_val
     if transform_type == 'FilterCol':
+        if len(transform) < 3:
+            logging.warning('Not formed correctly: {}'.format(transform))
+            return df
         col_name = transform[1]
         col_val = transform[2]
         exclude_toggle = False

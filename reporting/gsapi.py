@@ -5,6 +5,7 @@ import logging
 import time
 import pandas as pd
 import reporting.utils as utl
+import reporting.vmcolumns as vmc
 from requests_oauthlib import OAuth2Session
 
 config_path = utl.config_path
@@ -22,6 +23,7 @@ class GsApi(object):
     head_str = 'header'
     doc_str = 'Doc'
     text_format = 'NORMAL_TEXT'
+    screenshot_dir = os.path.join('screenshots', 'charts/')
 
     def __init__(self):
         self.default_config = "gsapi_screenshots.json"
@@ -271,6 +273,10 @@ class GsApi(object):
         return row_requests, index
 
     def add_table(self, data, index):
+        """
+        See for indexing: (https://stackoverflow.com/questions/75689738/
+        how-can-i-dynamically-populate-a-table-in-google-doc-using-their-api)
+        """
         if not data:
             return index
         start_ind = index
@@ -290,6 +296,45 @@ class GsApi(object):
         table_requests.append(self.get_format_req(start_ind, index - 1,
                                                   self.text_format))
         return table_requests, index - 1
+
+    def add_image_doc(self, presigned_url, index):
+        if not presigned_url:
+            return [], index
+        img_request = [{'insertInlineImage': {
+            'location': {
+                'index': index
+            },
+            'uri': presigned_url,
+            'objectSize': {
+                'height': {
+                    'magnitude': 250,
+                    'unit': 'PT'
+                },
+                'width': {
+                    'magnitude': 250,
+                    'unit': 'PT'
+                }
+            }
+        }}, {
+            'insertText': {
+                'location': {
+                    'index': index + 1,
+                },
+                'text': '\n'
+            }
+        }]
+        index += 2
+        return img_request, index
+
+    def get_file_by_name(self, name):
+        self.get_client()
+        q = "name = '{}'".format(name)
+        params = {'q': q}
+        return self.client.get(self.files_url, params=params)
+
+    def delete_file(self, file_id):
+        url = self.files_url + '/{}'.format(file_id)
+        self.client.delete(url)
 
     def add_text(self, doc_id, text_json=None, index=1, newline=True):
         logging.info('Adding text to doc.')
@@ -318,10 +363,40 @@ class GsApi(object):
             format_request.append(self.get_format_req(index, end_ind, style))
             index += len(text)
             if 'data' in item:
-                table_req, index = self.add_table(item['data']['data'],
-                                                  index=index)
+                table_req = []
+                if 'imgURI' in item['data']['cols']:
+                    presigned_url = item['url']
+                    table_req, index = self.add_image_doc(presigned_url, index)
+                elif item['data']['cols']:
+                    table_req, index = self.add_table(item['data']['data'],
+                                                      index=index)
                 request += table_req
         request += format_request
         body = {"requests": request}
         response = self.client.post(url=url, json=body, headers=headers)
         return response, body
+
+    def check_sheet_id(self, results, acc_col, success_msg, failure_msg):
+        self.get_client()
+        url = self.create_url()
+        r = self.client.get(url)
+        if (r.status_code == 200 and
+                'values' in r.json()):
+            row = [acc_col, ' '.join([success_msg, str(self.sheet_id)]),
+                   True]
+            results.append(row)
+        else:
+            msg = ('Permissions NOT Granted. '
+                   'Double Check Sheet ID and Ensure Permissions were granted.'
+                   '\n Error Msg:')
+            r = r.json()
+            row = [acc_col, ' '.join([failure_msg, msg, r['error']['message']]), False]
+            results.append(row)
+        return results, r
+
+    def test_connection(self, acc_col, camp_col=None, acc_pre=None):
+        success_msg = 'SUCCESS:'
+        failure_msg = 'FAILURE:'
+        results, r = self.check_sheet_id(
+            [], acc_col, success_msg, failure_msg)
+        return pd.DataFrame(data=results, columns=vmc.r_cols)

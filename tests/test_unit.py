@@ -13,6 +13,7 @@ import reporting.calc as cal
 import reporting.analyze as az
 import reporting.export as exp
 import reporting.expcolumns as exc
+import reporting.azapi as azapi
 
 
 def func(x):
@@ -113,9 +114,67 @@ class TestUtils:
         assert sw.browser.current_url == test_url
         sw.quit()
 
+    def test_screenshot(self):
+        sw = utl.SeleniumWrapper(headless=False)
+        test_url = 'https://www.gamespot.com/'
+        file_name = 'test.png'
+        sw.take_screenshot(test_url, file_name=file_name)
+        assert os.path.isfile(file_name)
+        os.remove(file_name)
+        sw.quit()
+
+    @pytest.mark.parametrize(
+        'sd, ed, expected_output', [
+            (dt.datetime.today(),
+             dt.datetime.today(),
+             (dt.date.today(), dt.date.today())),
+            (dt.datetime.today(),
+             dt.datetime.today() - dt.timedelta(days=1),
+             (dt.date.today() - dt.timedelta(days=1),
+              dt.date.today() - dt.timedelta(days=1)))
+        ],
+        ids=['today', 'bad_sd']
+    )
+    def test_date_check(self, sd, ed, expected_output):
+        output = utl.date_check(sd, ed)
+        assert output == expected_output
+
+    def test_get_next_number_from_list(self):
+        lower_name = 'a'
+        cur_model_name = 'b50'
+        next_num = '5000'
+        last_num = ['$10', ',', '000']
+        words = [lower_name, cur_model_name, next_num, lower_name] + last_num
+        num = utl.get_next_number_from_list(words, lower_name, cur_model_name)
+        assert num == next_num
+        num = utl.get_next_number_from_list(words, lower_name, cur_model_name,
+                                            last_instance=True)
+        assert num == ''.join(last_num).replace('$', '').replace(',', '')
+
+    def test_get_next_values_from_list(self):
+        plan_name = 'X Y Z'
+        message = 'Plan named {}'.format(plan_name)
+        words = utl.lower_words_from_str(message)
+        words = utl.get_next_values_from_list(words, )
+        assert words[0] == plan_name
+
 
 class TestApis:
-    pass
+
+    def make_fake_config(self, key_list, tmp_path_factory):
+        json_data = {}
+        for cur_key in key_list:
+            json_data[cur_key] = '{} - value'.format(cur_key)
+        file_name = '{}/config.json'.format(tmp_path_factory.mktemp("config"))
+        return file_name, json_data
+
+    def test_azapi(self, tmp_path_factory):
+        api = azapi.AzApi()
+        file_name, json_data = self.make_fake_config(
+            api.key_list, tmp_path_factory)
+        api.input_config()
+        df = pd.DataFrame({'uploadid': ['a'], 'productname': ['b']})
+        api.s3_write_file(df)
 
 
 class TestDictionary:
@@ -546,6 +605,47 @@ class TestAnalyze:
         assert cdc.double_counting_all in df[cdc.error_col].values
         assert 'API_Tiktok_Test' in df[vmc.vendorkey][0]
         assert 'API_Rawfile_Test' in df[vmc.vendorkey][0]
+
+    def test_placement_not_in_mp(self):
+        df = pd.DataFrame({
+            dctc.VEN: {0: 'TikTok', 1: 'TikTok', 2: 'TikTok'},
+            vmc.vendorkey: {0: 'API_Tiktok_Test', 1: 'API_Tiktok_Test',
+                            2: vmc.api_mp_key},
+            vmc.clicks: {0: 15.0, 1: 15.0, 2: 0},
+            vmc.date: {0: '7/27/2022', 1: '7/27/2022', 2: '7/27/2022'},
+            dctc.PN: {0: 'Test', 1: 'Test1', 2: 'Test'}})
+        df = utl.data_to_type(df, date_col=[vmc.date, dctc.PD])
+        cpmp = az.CheckPlacementsNotInMp(az.Analyze())
+        df = cpmp.find_placements_not_in_mp(df)
+        assert 'Test1' in df[dctc.PN].values
+        assert 'Test' not in df[dctc.PN].values
+
+    def test_placement_not_in_mp_empty(self):
+        df = pd.DataFrame({
+            dctc.VEN: {0: 'TikTok', 1: 'TikTok'},
+            vmc.vendorkey: {0: 'API_Tiktok_Test', 1: 'API_Tiktok_Test'},
+            vmc.clicks: {0: 15.0, 1: 15.0},
+            vmc.date: {0: '7/27/2022', 1: '7/27/2022'},
+            dctc.PN: {0: 'Test', 1: 'Test1'}})
+        df = utl.data_to_type(df, date_col=[vmc.date, dctc.PD])
+        cpmp = az.CheckPlacementsNotInMp(az.Analyze())
+        df = cpmp.find_placements_not_in_mp(df)
+        assert df.empty
+
+    def test_all_placement_in_mp(self):
+        df = pd.DataFrame({
+            dctc.VEN: {0: 'TikTok', 1: 'TikTok', 2: 'TikTok', 3: 'TikTok'},
+            vmc.vendorkey: {0: 'API_Tiktok_Test', 1: 'API_Tiktok_Test',
+                            2: vmc.api_mp_key, 3: vmc.api_mp_key},
+            vmc.clicks: {0: 15.0, 1: 15.0, 2: 0, 3: 0},
+            vmc.date: {0: '7/27/2022', 1: '7/27/2022', 2: '7/27/2022',
+                       3: '7/27/2022'},
+            dctc.PN: {0: 'Test', 1: 'Test1', 2: 'Test', 3: 'Test1'}})
+        df = utl.data_to_type(df, date_col=[vmc.date, dctc.PD])
+        cpmp = az.CheckPlacementsNotInMp(az.Analyze())
+        df = cpmp.find_placements_not_in_mp(df)
+        assert 'Test' not in df[dctc.PN].values
+        assert 'Test1' not in df[dctc.PN].values
 
     def test_find_double_counting_empty(self):
         df = pd.DataFrame()

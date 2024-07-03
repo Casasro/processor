@@ -1,10 +1,12 @@
 import os
 import io
 import re
+import gzip
 import json
 import time
 import shutil
 import logging
+import base64
 import pandas as pd
 import numpy as np
 import datetime as dt
@@ -13,6 +15,12 @@ import reporting.vmcolumns as vmc
 import reporting.dictcolumns as dctc
 import reporting.expcolumns as exc
 import selenium.common.exceptions as ex
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+
 
 config_path = 'config/'
 raw_path = 'raw_data/'
@@ -44,9 +52,9 @@ def dir_check(directory):
 
 
 def import_read_csv(filename, path=None, file_check=True, error_bad='error',
-                    empty_df=False, nrows=None):
+                    empty_df=False, nrows=None, file_type=None):
     sheet_names = []
-    if sheet_name_splitter in filename:
+    if file_check and sheet_name_splitter in filename:
         filename = filename.split(sheet_name_splitter)
         sheet_names = filename[1:]
         filename = filename[0]
@@ -56,7 +64,8 @@ def import_read_csv(filename, path=None, file_check=True, error_bad='error',
         if not os.path.isfile(filename):
             logging.warning('{} not found.  Continuing.'.format(filename))
             return pd.DataFrame()
-    file_type = os.path.splitext(filename)[1].lower()
+    if not file_type:
+        file_type = os.path.splitext(filename)[1].lower()
     kwargs = {'parse_dates': True, 'keep_default_na': False,
               'na_values': na_values, 'nrows': nrows}
     if sheet_names:
@@ -67,19 +76,25 @@ def import_read_csv(filename, path=None, file_check=True, error_bad='error',
         read_func = pd.read_csv
         kwargs['encoding'] = 'utf-8'
         kwargs['on_bad_lines'] = error_bad
+        kwargs['low_memory'] = False
     try:
         df = read_func(filename, **kwargs)
     except UnicodeDecodeError:
         if 'encoding' in kwargs:
             kwargs['encoding'] = 'iso-8859-1'
         df = read_func(filename, **kwargs)
-    except pd.errors.EmptyDataError:
-        logging.warning('Raw Data {} empty.  Continuing.'.format(filename))
+    except pd.errors.EmptyDataError as e:
+        msg = 'Data {} empty.  Continuing. {}'.format(filename, e)
+        logging.warning(msg)
         if empty_df:
             df = pd.DataFrame()
         else:
             df = None
             return df
+    except ValueError as e:
+        logging.warning(e)
+        read_func = pd.read_csv
+        df = read_func(filename, **kwargs)
     if sheet_names:
         df = pd.concat(df, ignore_index=True, sort=True)
     df = df.rename(columns=lambda x: x.strip())
@@ -115,6 +130,8 @@ def exceldate_to_datetime(excel_date):
 
 
 def string_to_date(my_string):
+    month_list = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                  'Jul', 'Aug', 'Sept', 'Oct', 'Nov', 'Dec']
     if ('/' in my_string and my_string[-4:][:2] != '20' and
             ':' not in my_string and len(my_string) in [6, 7, 8]):
         try:
@@ -123,10 +140,10 @@ def string_to_date(my_string):
             logging.warning('Could not parse date: {}'.format(my_string))
             return pd.NaT
     elif ('/' in my_string and my_string[-4:][:2] == '20' and
-            ':' not in my_string):
+          ':' not in my_string):
         return dt.datetime.strptime(my_string, '%m/%d/%Y')
     elif (((len(my_string) == 5) and (my_string[0] == '4')) or
-            ((len(my_string) == 7) and ('.' in my_string))):
+          ((len(my_string) == 7) and ('.' in my_string))):
         return exceldate_to_datetime(float(my_string))
     elif len(my_string) == 8 and my_string.isdigit() and my_string[0] == '2':
         try:
@@ -139,7 +156,7 @@ def string_to_date(my_string):
     elif my_string == '0' or my_string == '0.0':
         return pd.NaT
     elif ((len(my_string) == 22) and (':' in my_string) and
-            ('+' in my_string)):
+          ('+' in my_string)):
         my_string = my_string[:-6]
         return dt.datetime.strptime(my_string, '%Y-%m-%d %M:%S')
     elif ((':' in my_string) and ('/' in my_string) and my_string[1] == '/' and
@@ -152,10 +169,31 @@ def string_to_date(my_string):
         return dt.datetime.strptime(my_string, '%a %b %d %M:%S:%H %Y')
     elif (('-' in my_string) and (my_string[:2] == '20') and
           len(my_string) == 10):
-        return dt.datetime.strptime(my_string, '%Y-%m-%d')
+        try:
+            return dt.datetime.strptime(my_string, '%Y-%m-%d')
+        except ValueError:
+            try:
+                return dt.datetime.strptime(my_string, '%Y-%d-%m')
+            except ValueError:
+                logging.warning('Could not parse date: {}'.format(my_string))
+                return pd.NaT
     elif ((len(my_string) == 19) and (my_string[:2] == '20') and
           ('-' in my_string) and (':' in my_string)):
-        return dt.datetime.strptime(my_string, '%Y-%m-%d %H:%M:%S')
+        try:
+            return dt.datetime.strptime(my_string, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            logging.warning('Could not parse date: {}'.format(my_string))
+            return pd.NaT
+    elif ((len(my_string) == 7 or len(my_string) == 8) and
+          my_string[-4:-2] == '20'):
+        return dt.datetime.strptime(my_string, '%m%d%Y')
+    elif ((len(my_string) == 6 or len(my_string) == 5) and
+          my_string[-3:] in month_list):
+        my_string = my_string + '-' + dt.datetime.today().strftime('%Y')
+        return dt.datetime.strptime(my_string, '%d-%b-%Y')
+    elif len(my_string) == 24 and my_string[-3:] == 'GMT':
+        my_string = my_string[4:-11]
+        return dt.datetime.strptime(my_string, '%d%b%Y')
     else:
         return my_string
 
@@ -260,7 +298,7 @@ def apply_rules(df, vm_rules, pre_or_post, **kwargs):
         queries = kwargs[vm_rules[rule][RULE_QUERY]]
         factor = kwargs[vm_rules[rule][RULE_FACTOR]]
         if (str(metrics) == 'nan' or str(queries) == 'nan' or
-           str(factor) == 'nan'):
+                str(factor) == 'nan'):
             continue
         metrics = metrics.split('::')
         if metrics[0] != pre_or_post:
@@ -439,25 +477,66 @@ def image_to_binary(file_name, as_bytes_io=False):
     return image_data
 
 
+def base64_to_binary(data):
+    data = data.split(',')[1]
+    decoded_bytes = base64.b64decode(data)
+    return io.BytesIO(decoded_bytes)
+
+
+def write_df_to_buffer(df, file_name='raw', default_format=True,
+                       base_folder=''):
+    csv_file = '{}{}'.format(file_name, '.csv')
+    if default_format:
+        gzip_extension = '.gzip'
+    else:
+        gzip_extension = '.gz'
+    zip_file = '{}{}'.format(file_name, gzip_extension)
+    today_yr = dt.datetime.strftime(dt.datetime.today(), '%Y')
+    today_str = dt.datetime.strftime(dt.datetime.today(), '%m%d')
+    today_folder_name = '{}/{}/'.format(today_yr, today_str)
+    product_name = '{}_{}'.format(df['uploadid'].unique()[0],
+                                  '_'.join(df['productname'].unique()))
+    product_name = re.sub(r'\W+', '', product_name)
+    zip_file = '{}/{}{}/{}'.format(
+        base_folder, today_folder_name, product_name, zip_file)
+    buffer = io.BytesIO()
+    with gzip.GzipFile(filename=csv_file, fileobj=buffer, mode="wb") as f:
+        f.write(df.to_csv().encode())
+    buffer.seek(0)
+    return buffer, zip_file
+
+
 class SeleniumWrapper(object):
     def __init__(self, mobile=False, headless=True):
         self.mobile = mobile
         self.headless = headless
         self.browser, self.co = self.init_browser(self.headless)
         self.base_window = self.browser.window_handles[0]
+        self.select_id = By.ID
+        self.select_class = By.CLASS_NAME
+        self.select_xpath = By.XPATH
+        self.select_css = By.CSS_SELECTOR
 
     def init_browser(self, headless):
         download_path = os.path.join(os.getcwd(), 'tmp')
         co = wd.chrome.options.Options()
         if headless:
-            co.headless = True
+            co.add_argument('--headless=new')
+        co.add_argument(
+            "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/99.0.4844.51 "
+            "Safari/537.36")
         co.add_argument('--disable-features=VizDisplayCompositor')
         co.add_argument('--window-size=1920,1080')
         co.add_argument('--start-maximized')
         co.add_argument('--no-sandbox')
         co.add_argument('--disable-gpu')
-        prefs = {'download.default_directory': download_path}
+        prefs = {'download.default_directory': download_path,
+                 "credentials_enable_service": False,
+                 "profile.password_manager_enabled": False
+                 }
         co.add_experimental_option('prefs', prefs)
+        co.add_experimental_option('excludeSwitches', ['enable-automation'])
         if self.mobile:
             mobile_emulation = {"deviceName": "iPhone X"}
             co.add_experimental_option("mobileEmulation", mobile_emulation)
@@ -476,7 +555,7 @@ class SeleniumWrapper(object):
                   'params': {'behavior': 'allow', 'downloadPath': download_dir}}
         driver.execute("send_command", params)
 
-    def go_to_url(self, url, sleep=5):
+    def go_to_url(self, url, sleep=5, elem_id=''):
         logging.info('Going to url {}.'.format(url))
         max_attempts = 10
         for x in range(max_attempts):
@@ -489,7 +568,10 @@ class SeleniumWrapper(object):
                 if x > (max_attempts - 2):
                     logging.warning('More than ten attempts returning.')
                     return False
-        time.sleep(sleep)
+        if elem_id:
+            self.wait_for_elem_load(elem_id)
+        else:
+            time.sleep(sleep)
         return True
 
     @staticmethod
@@ -497,10 +579,41 @@ class SeleniumWrapper(object):
         elem.click()
         time.sleep(sleep)
 
-    def click_on_xpath(self, xpath, sleep=2):
-        self.click_on_elem(self.browser.find_element_by_xpath(xpath), sleep)
+    def scroll_to_elem(self, elem,
+                       scroll_script="arguments[0].scrollIntoView();"):
+        self.browser.execute_script(scroll_script, elem)
+
+    def click_error(self, elem, e, attempts=0):
+        logging.info(e)
+        scroll_script = "arguments[0].scrollIntoView();"
+        if attempts > 5:
+            scroll_script = "window.scrollTo(0, 0)"
+        try:
+            self.scroll_to_elem(elem, scroll_script)
+        except ex.StaleElementReferenceException as e:
+            logging.warning(e)
+        time.sleep(.1)
+        return False
+
+    def click_on_xpath(self, xpath='', sleep=2, elem=None):
+        elem_click = True
+        for x in range(10):
+            if not elem:
+                elem = self.browser.find_element_by_xpath(xpath)
+            try:
+                self.click_on_elem(elem, sleep)
+            except (ex.ElementNotInteractableException,
+                    ex.ElementClickInterceptedException,
+                    ex.StaleElementReferenceException) as e:
+                elem_click = self.click_error(elem, e, x)
+            if elem_click:
+                break
+            else:
+                elem_click = True
+        return elem_click
 
     def quit(self):
+        self.browser.close()
         self.browser.quit()
 
     @staticmethod
@@ -527,11 +640,48 @@ class SeleniumWrapper(object):
         ads = self.get_all_iframe_ads()
         return ads
 
+    def click_accept_buttons(self, btn_xpath):
+        wait = WebDriverWait(self.browser, 3)
+        try:
+            accept_buttons = wait.until(
+                EC.visibility_of_all_elements_located((By.XPATH, btn_xpath)))
+        except ex.TimeoutException as e:
+            accept_buttons = None
+        if accept_buttons:
+            self.click_on_xpath(sleep=3, elem=accept_buttons[0])
+
+    def accept_cookies(self):
+        btn = ['AKZEPTIEREN UND WEITER', 'Accept Cookies', 'OK',
+               'Accept All Cookies', 'Zustimmen', 'Accetto', "J'ACCEPTE",
+               'Accetta', 'I agree', 'Continue', 'Proceed']
+        btn_xpath = [
+            """//*[contains(normalize-space(text()), "{}")]""".format(x)
+            for x in btn]
+        btn_xpath = ' | '.join(btn_xpath)
+        self.click_accept_buttons(btn_xpath)
+        iframes = self.browser.find_elements(By.TAG_NAME, "iframe")
+        for iframe in iframes:
+            try:
+                is_displayed = iframe.is_displayed()
+            except ex.StaleElementReferenceException as e:
+                logging.warning(e)
+                is_displayed = False
+            if is_displayed:
+                try:
+                    self.browser.switch_to.frame(iframe)
+                except ex.WebDriverException as e:
+                    logging.warning(e)
+                    continue
+                self.click_accept_buttons(btn_xpath)
+                self.browser.switch_to.default_content()
+
     def take_screenshot(self, url=None, file_name=None):
         logging.info('Getting screenshot from {} and '
                      'saving to {}.'.format(url, file_name))
         went_to_url = self.go_to_url(url)
         if went_to_url:
+            self.accept_cookies()
+            self.browser.execute_script("window.scrollTo(0, 0)")
             self.browser.save_screenshot(file_name)
 
     def take_elem_screenshot(self, url=None, xpath=None, file_name=None):
@@ -574,22 +724,106 @@ class SeleniumWrapper(object):
             time.sleep(5)
         return ads
 
-    def send_keys_from_list(self, elem_input_list, get_xpath_from_id=True):
+    def send_keys_wrapper(self, elem, value):
+        elem_sent = True
+        for x in range(10):
+            try:
+                elem.send_keys(value)
+            except ex.ElementNotInteractableException as e:
+                elem_sent = self.click_error(elem, e)
+            if elem_sent:
+                break
+            else:
+                elem_sent = True
+        return elem_sent
+
+    def send_multiple_keys_wrapper(self, elem, items):
+        for item in items:
+            self.send_keys_wrapper(elem, item)
+            wd.ActionChains(self.browser).send_keys(Keys.TAB).perform()
+
+    def send_keys_from_list(self, elem_input_list, get_xpath_from_id=True,
+                            clear_existing=True, send_escape=True):
+        select_xpath = 'selectized'
         for item in elem_input_list:
             elem_xpath = item[1]
             if get_xpath_from_id:
                 elem_xpath = self.get_xpath_from_id(elem_xpath)
             elem = self.browser.find_element_by_xpath(elem_xpath)
-            elem.send_keys(item[0])
-            if 'selectized' in elem_xpath:
+            clear_specified = len(item) > 2 and item[2] == 'clear'
+            elem_to_clear = select_xpath in elem_xpath or clear_specified
+            if clear_existing and elem_to_clear:
+                clear_xs = ['preceding-sibling::span/a[@class="remove-single"]',
+                            '../following-sibling::a[@class="clear"]']
+                for clear_x in clear_xs:
+                    clear_val = elem.find_elements_by_xpath(clear_x)
+                    if len(clear_val) > 0:
+                        self.click_on_xpath(elem=clear_val[0])
+                        break
+            if elem.get_attribute('type') == 'checkbox':
+                self.click_on_xpath(elem=elem)
+            else:
+                if type(item[0]) == list:
+                    self.send_multiple_keys_wrapper(elem, item[0])
+                else:
+                    self.send_keys_wrapper(elem, item[0])
+            if select_xpath in elem_xpath:
                 elem.send_keys(u'\ue007')
+                if send_escape:
+                    wd.ActionChains(self.browser).send_keys(
+                        Keys.ESCAPE).perform()
 
-    def xpath_from_id_and_click(self, elem_id, sleep=2):
+    def xpath_from_id_and_click(self, elem_id, sleep=2, load_elem_id=''):
+        if load_elem_id:
+            sleep = .1
         self.click_on_xpath(self.get_xpath_from_id(elem_id), sleep)
+        if load_elem_id:
+            self.wait_for_elem_load(load_elem_id)
 
     @staticmethod
     def get_xpath_from_id(elem_id):
         return '//*[@id="{}"]'.format(elem_id)
+
+    def wait_for_elem_load(self, elem_id, selector=None, attempts=100,
+                           sleep_time=.05, visible=False):
+        selector = selector if selector else self.select_id
+        elem_found = False
+        for x in range(attempts):
+            e = self.browser.find_elements(selector, elem_id)
+            if e:
+                elem_visible = True
+                if visible:
+                    try:
+                        elem_visible = e[0].is_displayed()
+                    except ex.StaleElementReferenceException:
+                        e = self.browser.find_elements(selector, elem_id)
+                        elem_visible = e[0].is_displayed()
+                if elem_visible:
+                    elem_found = True
+                    break
+            time.sleep(sleep_time)
+        return elem_found
+
+    def drag_and_drop(self, elem, target):
+        action_chains = wd.ActionChains(self.browser)
+        action_chains.drag_and_drop(elem, target).perform()
+
+    def get_element_order(self, elem1_id, elem2_id):
+        elem1 = self.browser.find_element_by_id(elem1_id)
+        elem2 = self.browser.find_element_by_id(elem2_id)
+        first_element_position = self.browser.execute_script(
+            "return arguments[0].getBoundingClientRect().top", elem1)
+        second_element_position = self.browser.execute_script(
+            "return arguments[0].getBoundingClientRect().top", elem2)
+        return first_element_position < second_element_position
+
+    def count_rows_in_table(self, elem_id=''):
+        elem = self.browser.find_element
+        if elem_id:
+            elem = elem(By.ID, elem_id)
+        tbody = elem.find_element(By.CSS_SELECTOR, "table > tbody")
+        rows = tbody.find_elements(By.TAG_NAME, "tr")
+        return len(rows)
 
 
 def copy_file(old_file, new_file, attempt=1, max_attempts=100):
@@ -631,7 +865,7 @@ def copy_tree_no_overwrite(old_path, new_path, log=True, overwrite=False):
 
 
 def lower_words_from_str(word_str):
-    words = re.findall(r"[\w']+|[.,!?;]", word_str)
+    words = re.findall(r"[\w']+|[.,!?;/]", word_str)
     words = [x.lower() for x in words]
     return words
 
@@ -683,20 +917,77 @@ def get_dict_values_from_list(list_search, dict_check, check_dupes=False):
 def check_dict_for_key(dict_to_check, key, missing_return_value=''):
     if key in dict_to_check:
         return_value = dict_to_check[key]
+        if not return_value:
+            return_value = missing_return_value
     else:
         return_value = missing_return_value
     return return_value
 
 
-def get_next_number_from_list(words, lower_name, cur_model_name):
+def get_next_number_from_list(words, lower_name, cur_model_name,
+                              last_instance=False, break_words_list=None):
+    if lower_name not in words:
+        for x in lower_name.split('_'):
+            if x in words:
+                lower_name = x
+                break
     post_words = words[words.index(lower_name):]
+    if break_words_list:
+        for idx, x in enumerate(post_words):
+            if idx != 0 and x in break_words_list:
+                post_words = post_words[:idx]
+                break
+    if last_instance:
+        idx = next(i for i in reversed(range(len(post_words)))
+                   if post_words[i] == lower_name)
+        post_words = post_words[idx:]
     cost = [x for x in post_words if
-            any(y.isdigit() for y in x) and x != cur_model_name]
+            any(y.isdigit() for y in x) and
+            x not in [cur_model_name, lower_name]]
     if cost:
-        cost = cost[0].replace('k', '000')
+        if len(cost) > 1:
+            cost_append = ''
+            post_words = post_words[post_words.index(cost[0]):]
+            for x in range(1, len(post_words), 2):
+                two_comb = post_words[x:x + 2]
+                if len(two_comb) > 1 and two_comb[0] == ',':
+                    cost_append += two_comb[1]
+                else:
+                    break
+            cost = [cost[0] + cost_append]
+        cost = cost[0].replace('$', '')
+        cost = cost.replace('k', '000')
+        cost = cost.replace('m', '000000')
     else:
         cost = 0
+    if any(c.isalpha() for c in str(cost)):
+        cost = 0
     return cost
+
+
+def get_next_values_from_list(first_list, match_list=None, break_list=None,
+                              date_search=False):
+    name_list = ['named', 'called', 'name', 'title', 'categorized']
+    if not match_list:
+        match_list = name_list.copy()
+    match_list = is_list_in_list(match_list, first_list, False, True)
+    if not match_list:
+        return []
+    first_list = first_list[first_list.index(match_list[0]) + 1:]
+    if break_list:
+        for value in first_list:
+            if value in break_list and value not in match_list:
+                first_list = first_list[:first_list.index(value)]
+                break
+    first_list = [x for x in first_list if x not in name_list]
+    delimit = ''
+    if not date_search:
+        first_list = [x.capitalize() for x in first_list
+                      if not (x.isdigit() and int(x) > 10)]
+        delimit = ' '
+    first_list = delimit.join(first_list).split('.')[0].split(',')
+    first_list = [x.strip(' ') for x in first_list]
+    return first_list
 
 
 class NpEncoder(json.JSONEncoder):

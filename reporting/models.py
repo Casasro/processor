@@ -1,8 +1,7 @@
 # coding: utf-8
 from sqlalchemy import BigInteger, Column, Date, ForeignKey,\
     Numeric, Text, text
-from sqlalchemy.orm import relationship
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
 metadata = Base.metadata
@@ -936,7 +935,7 @@ class EventBrand(Base):
     __table_args__ = {'schema': 'lqadb'}
 
     eventbrandid = Column(BigInteger, primary_key=True, server_default=text(
-        "nextval('lqadb.eventconv_eventconvid_seq'::regclass)"))
+        "nextval('lqadb.eventbrand_eventbrandid_seq'::regclass)"))
     eventbrandname = Column(Text)
     eventid = Column(ForeignKey(
         'lqadb.event.eventid', ondelete='CASCADE'))

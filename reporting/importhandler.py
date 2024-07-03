@@ -33,8 +33,11 @@ import reporting.yvapi as yvapi
 import reporting.ssapi as ssapi
 import reporting.nzapi as nzapi
 import reporting.ytdapi as ytdapi
+import reporting.simapi as simapi
+import reporting.pixapi as pixapi
 import reporting.ftp as ftp
 import reporting.awss3 as awss3
+import reporting.azapi as azu
 import reporting.export as export
 import reporting.vmcolumns as vmc
 import reporting.vendormatrix as vm
@@ -48,6 +51,7 @@ class ImportHandler(object):
         self.class_list = {
             vmc.api_fb_key: fbapi.FbApi,
             vmc.api_aw_key: awapi.AwApi,
+            vmc.api_goad_key: awapi.AwApi,
             vmc.api_tw_key: twapi.TwApi,
             vmc.api_ttd_key: ttdapi.TtdApi,
             vmc.api_ga_key: gaapi.GaApi,
@@ -57,6 +61,7 @@ class ImportHandler(object):
             vmc.api_aj_key: ajapi.AjApi,
             vmc.api_dc_key: dcapi.DcApi,
             vmc.api_db_key: dbapi.DbApi,
+            vmc.api_dvo_key: dbapi.DbApi,
             vmc.api_vk_key: vkapi.VkApi,
             vmc.api_rs_key: rsapi.RsApi,
             vmc.api_rc_key: rcapi.RcApi,
@@ -76,7 +81,10 @@ class ImportHandler(object):
             vmc.api_amd_key: amzapi.AmzApi,
             vmc.api_ss_key: ssapi.SsApi,
             vmc.api_nz_key: nzapi.NzApi,
-            vmc.api_ytd_key: ytdapi.YtdApi
+            vmc.api_ytd_key: ytdapi.YtdApi,
+            vmc.api_wal_key: ttdapi.TtdApi,
+            vmc.api_sim_key: simapi.SimApi,
+            vmc.api_pix_key: pixapi.PixApi
         }
 
     def output(self, api_df, filename, api_merge=None, first_row=None,
@@ -271,3 +279,18 @@ class ImportHandler(object):
     def s3_loop(self):
         if self.arg_check('dna'):
             self.s3_load(self.matrix.s3_dna_key, awss3.S3())
+
+    def azu_load(self, azu_key, azu_class):
+        for vk in azu_key:
+            params = self.matrix.vendor_set(vk)
+            azu_class.input_config(params[vmc.apifile])
+            azu_class.header = params[vmc.firstrow]
+            df = azu_class.get_data()
+            self.output(df, params[vmc.filename], params[vmc.apimerge],
+                        params[vmc.firstrow], params[vmc.lastrow],
+                        params[vmc.date], params[vmc.startdate],
+                        params[vmc.enddate])
+
+    def azu_loop(self):
+        if self.arg_check('dna'):
+            self.azu_load(self.matrix.azu_dna_key, azu.AzuApi())

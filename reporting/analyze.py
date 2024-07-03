@@ -44,6 +44,7 @@ class Analyze(object):
     missing_metrics = 'missing_metrics'
     flagged_metrics = 'flagged_metrics'
     placement_col = 'placement_col'
+    non_mp_placement_col = 'non_mp_placement_col'
     max_api_length = 'max_api_length'
     double_counting_all = 'double_counting_all'
     double_counting_partial = 'double_counting_partial'
@@ -98,7 +99,7 @@ class Analyze(object):
             CheckColumnNames, FindPlacementNameCol, CheckAutoDictOrder,
             CheckApiDateLength, CheckFlatSpends, CheckDoubleCounting,
             GetPacingAnalysis, GetDailyDelivery, GetServingAlerts,
-            GetDailyPacingAlerts, CheckPackageCapping]
+            GetDailyPacingAlerts, CheckPackageCapping, CheckPlacementsNotInMp]
         if self.df.empty and self.file_name:
             self.load_df_from_file()
         if self.load_chat:
@@ -146,7 +147,7 @@ class Analyze(object):
             return False
         df = df.groupby(plan_names).apply(lambda x: 0 if x[dctc.PNC].sum() == 0
                                           else x[vmc.cost].sum() /
-                                          x[dctc.PNC].sum())
+                                               x[dctc.PNC].sum())
         f_df = df[df > 1]
         if f_df.empty:
             delivery_msg = 'Nothing has delivered in full.'
@@ -443,8 +444,9 @@ class Analyze(object):
         split_values = ['{} ({})'.format(x, y) for x, y in
                         format_df[[split, kpi]].values]
         split_values = ', '.join(split_values)
+        split_name = split if split == vmc.date else split[2:]
         msg = '{} value(s) for KPI {} broken out by {} are {}'.format(
-            small_large, kpi, split, split_values)
+            small_large, kpi, split_name, split_values)
         if filter_col:
             msg = '{} when filtered by the {} {}'.format(
                 msg, filter_col, filter_val)
@@ -461,8 +463,9 @@ class Analyze(object):
         df = self.get_df_based_on_kpi(kpi, group, metrics, split, filter_col,
                                       filter_val)
         if df.empty:
+            split_name = split if split == vmc.date else split[2:]
             msg = ('Value(s) for KPI {} broken out by {} could '
-                   'not be calculated'.format(kpi, split))
+                   'not be calculated'.format(kpi, split_name))
             if filter_col:
                 msg = '{} when filtered by the {} {}'.format(
                     msg, filter_col, filter_val)
@@ -669,7 +672,11 @@ class Analyze(object):
             min_date = tdf['{} - amin'.format(vmc.date)][0].date()
             sd = cds.p[vmc.startdate].date()
             ed = cds.p[vmc.enddate].date()
-            if max_date < sd:
+            if any(pd.isnull(x) for x in [max_date, min_date]):
+                msg = 'Max date {} or min date {} is not a date.'.format(
+                    max_date, min_date)
+                msg = (False, msg)
+            elif max_date < sd:
                 msg = ('Last day in raw file {} is less than start date {}.\n'
                        'Result will be blank.  Change start date.'.format(
                          max_date, sd))
@@ -732,7 +739,7 @@ class Analyze(object):
                         msg = (
                             False, 'Old file total {} was greater than new '
                                    'file total {} for col {}'.format(
-                                      old_total, total, col))
+                                old_total, total, col))
                 cd[col][cds_name] = msg
         return cd
 
@@ -1090,6 +1097,8 @@ class CheckAutoDictOrder(AnalyzeBase):
         auto_place = source.p[vmc.autodicplace]
         if auto_place == dctc.PN:
             auto_place = source.p[vmc.placement]
+        if auto_place not in tdf.columns:
+            return df
         tdf = pd.DataFrame(tdf[auto_place].str.split('_').to_list())
         max_idx = 0
         max_val = 0
@@ -1353,6 +1362,11 @@ class CheckPackageCapping(AnalyzeBase):
             logging.warning('Missing columns: {}'.format(missing_cols))
             return pd.DataFrame()
         df = df[cols]
+        if any(not isinstance(x, (int, np.integer)) or
+               not isinstance(y, (int, np.integer)) for x, y in
+               df[[self.plan_net_temp, vmc.cost]].values):
+            logging.warning('Package Caps may not be formatted correctly')
+            return pd.DataFrame()
         df = df.groupby([temp_package_cap])
         df = df.apply(lambda x:
                       0 if x[self.plan_net_temp].sum() == 0
@@ -1598,12 +1612,12 @@ class CheckApiDateLength(AnalyzeBase):
         vk_list = []
         data_sources = self.matrix.get_all_data_sources()
         max_date_dict = {
-            vmc.api_amz_key: 60, vmc.api_szk_key: 60, vmc.api_db_key: 60,
+            vmc.api_amz_key: 31, vmc.api_szk_key: 60, vmc.api_db_key: 60,
             vmc.api_tik_key: 30, vmc.api_ttd_key: 80, vmc.api_sc_key: 30,
-            vmc.api_amd_key: 30}
+            vmc.api_amd_key: 30, vmc.api_cri_key: 99}
         data_sources = [x for x in data_sources if 'API_' in x.key]
         for ds in data_sources:
-            if 'API_' in ds.key:
+            if 'API_' in ds.key and vmc.enddate in ds.p:
                 key = ds.key.split('_')[1]
                 if key in max_date_dict.keys():
                     max_date = max_date_dict[key]
@@ -1883,9 +1897,9 @@ class CheckFlatSpends(AnalyzeBase):
         tdf = pd.DataFrame(columns=translation_df.columns)
         for aly_dict in aly_dicts:
             if aly_dict[self.error_col] == self.placement_date_error:
-                old_val = aly_dict[dctc.PD].strip('00:00:00').strip()
+                old_val = aly_dict[dctc.PD].replace('00:00:00', '').strip()
                 new_val = aly_dict[
-                    self.first_click_col].strip('00:00:00').strip()
+                    self.first_click_col].replace('00:00:00', '').strip()
                 try:
                     trans = [[dctc.PD, old_val, new_val,
                               'Select::' + dctc.PN,
@@ -2073,7 +2087,8 @@ class CheckDoubleCounting(AnalyzeBase):
                             logging.warning('No empty rules for {}. Could not '
                                             'auto-fix double counting.'
                                             .format(vk))
-                vks.remove(vk)
+                if vk in vks:
+                    vks.remove(vk)
         self.aly.matrix.vm_df = vm_df
         return vm_df
 
@@ -2501,6 +2516,52 @@ class GetDailyPacingAlerts(AnalyzeBase):
             param=self.aly.under_daily_pace, data=under_df.to_dict())
 
 
+class CheckPlacementsNotInMp(AnalyzeBase):
+    name = Analyze.non_mp_placement_col
+    fix = False
+    pre_run = False
+    tmp_col = 'temp'
+    merge = 'left'
+    merge_col = '_merge'
+    merge_filter = 'left_only'
+    cols = [vmc.vendorkey, dctc.VEN, dctc.PN]
+
+    def find_placements_not_in_mp(self, df):
+        """
+        Find placements in full output not included in the media plan.
+
+        """
+        if df.empty:
+            return pd.DataFrame(columns=self.cols)
+        df = df.groupby(self.cols).size()
+        df = df.reset_index().rename(columns={0: self.tmp_col})
+        mp_placements = (
+            df.loc[df[vmc.vendorkey] == vmc.api_mp_key][self.cols[1:]])
+        if mp_placements.empty:
+            return pd.DataFrame(columns=self.cols)
+        df_placements = df.loc[df[vmc.vendorkey] != vmc.api_mp_key]
+        merged_df = pd.merge(df_placements, mp_placements, how=self.merge,
+                             on=self.cols[1:], indicator=True)
+        filtered_df = merged_df[merged_df[self.merge_col] == self.merge_filter]
+        return filtered_df[self.cols]
+
+    def do_analysis(self):
+        df = self.aly.df
+        rdf = self.find_placements_not_in_mp(df)
+        if rdf.empty:
+            msg = ('No datasources have placements not included in the '
+                   'Media Plan.')
+            logging.info('{}'.format(msg))
+        else:
+            msg = ('The following datasources have placement names that were '
+                   'not included in the provided Media Plan. '
+                   'Consider Translating:')
+            logging.info('{}\n{}'.format(msg, rdf.to_string()))
+        self.add_to_analysis_dict(df=rdf, msg=msg)
+        self.aly.add_to_analysis_dict(key_col=self.name,
+                                      message=msg, data=rdf.to_dict())
+
+
 class ValueCalc(object):
     file_name = os.path.join(utl.config_path, 'aly_grouped_metrics.csv')
     metric_name = 'Metric Name'
@@ -2579,6 +2640,31 @@ class ValueCalc(object):
                 df[col] = df[item]
         return df
 
+    @staticmethod
+    def calculate_trending(df, col_name='DoD Change', metric=None,
+                           groupby=None, period=1, date='eventdate'):
+        group_and_date = list(groupby) + [date] if groupby else [date]
+        df = df.sort_values(by=group_and_date)
+        if groupby:
+            group_df = df.groupby(groupby)[metric]
+        else:
+            group_df = df[metric]
+        df[col_name] = group_df.pct_change(periods=period)
+        df = df.sort_values(by=date, ascending=False)
+        groupby_ascending = (
+            [True for _ in groupby] + [False] if groupby else [False])
+        df = df.sort_values(by=group_and_date, ascending=groupby_ascending)
+        return df
+
+    @staticmethod
+    def calculate_percent_total(df, metric, groupby='eventdate'):
+        groupby = groupby if type(groupby) == list else [groupby]
+        group_df = df.groupby(groupby)[metric]
+        group_sum = group_df.transform('sum')
+        df['% of {} by {}'.format(metric, ' , '.join(groupby))] = (
+                df[metric] / group_sum * 100)
+        return df
+
 
 class AliChat(object):
     openai_found = 'Here is the openai gpt response: '
@@ -2592,51 +2678,57 @@ class AliChat(object):
         self.db = None
         self.current_user = None
         self.models_to_search = None
+        self.message = ''
+        self.stop_words = self.get_stop_words()
         self.config = self.load_config(self.config_name, self.config_path)
 
     @staticmethod
     def load_config(config_name='openai.json', config_path='reporting'):
+        config = None
         file_name = os.path.join(config_path, config_name)
         try:
             with open(file_name, 'r') as f:
                 config = json.load(f)
         except IOError:
-            logging.error('{} not found.'.format(file_name))
+            logging.warning('{} not found.'.format(file_name))
         return config
 
     def get_openai_response(self, message):
-        openai.api_key = self.config['SECRET_KEY']
-        prompt = f"User: {message}\nAI:"
-        response = openai.Completion.create(
-            engine="text-davinci-002",
-            prompt=prompt,
-            max_tokens=1024,
-            n=1,
-            stop=None,
-            temperature=0.5,
-        )
-        return response.choices[0].text.strip()
+        response = 'OpenAI not configured could not get response.'
+        if self.config:
+            openai.api_key = self.config['SECRET_KEY']
+            prompt = f"User: {message}\nAI:"
+            response = openai.Completion.create(
+                engine="text-davinci-002",
+                prompt=prompt,
+                max_tokens=1024,
+                n=1,
+                stop=None,
+                temperature=0.5,
+            )
+            response = response.choices[0].text.strip()
+        return response
 
     @staticmethod
     def index_db_model_by_word(db_model):
         word_idx = {}
         db_all = db_model.query.all()
         for obj in db_all:
-            words = utl.lower_words_from_str(obj.name)
-            for word in words:
-                if word in word_idx:
-                    word_idx[word].append(obj.id)
-                else:
-                    word_idx[word] = [obj.id]
+            if obj.name:
+                words = utl.lower_words_from_str(obj.name)
+                for word in words:
+                    if word in word_idx:
+                        word_idx[word].append(obj.id)
+                    else:
+                        word_idx[word] = [obj.id]
         return word_idx
 
-    @staticmethod
-    def convert_model_ids_to_message(db_model, model_ids, message='',
+    def convert_model_ids_to_message(self, db_model, model_ids, message='',
                                      html_table=False, table_name=''):
         message = message + '<br>'
         html_response = ''
         for idx, model_id in enumerate(model_ids):
-            obj = db_model.query.get(model_id)
+            obj = self.db.session.get(db_model, model_id)
             if obj:
                 html_response += """
                     {}.  <a href="{}" target="_blank">{}</a><br>
@@ -2646,11 +2738,10 @@ class AliChat(object):
                 html_response += '<br>{}'.format(table_elem)
         return message, html_response
 
-    @staticmethod
-    def check_db_model_table(db_model, words, model_ids):
+    def check_db_model_table(self, db_model, words, model_ids):
         table_response = ''
         tables = [x for x in db_model.get_table_name_to_task_dict().keys()]
-        cur_model = db_model.query.get(next(iter(model_ids)))
+        cur_model = self.db.session.get(db_model, next(iter(model_ids)))
         cur_model_name = re.split(r'[_\s]|(?<=[a-z])(?=[A-Z])', cur_model.name)
         cur_model_name = [x.lower() for x in cur_model_name]
         for table in tables:
@@ -2669,23 +2760,22 @@ class AliChat(object):
 
     def find_db_model(self, db_model, message, other_db_model=None):
         word_idx = self.index_db_model_by_word(db_model)
-        message = re.sub(r'[^\w\s]', '', message)
-        nltk.download('stopwords')
-        stop_words = list(nltk.corpus.stopwords.words('english'))
-        stop_words += db_model.get_model_name_list()
-        if other_db_model:
-            stop_words += other_db_model.get_name_list()
-        words = utl.lower_words_from_str(message)
-        words = [x for x in words if x not in stop_words]
+        words = self.remove_stop_words_from_message(
+            message, db_model, other_db_model, remove_punctuation=True)
+        used_words = []
         model_ids = {}
         for word in words:
-            if word in word_idx:
+            if word in word_idx and word not in used_words:
+                word_val = 1
                 new_model_ids = word_idx[word]
+                used_words.append(word)
+                if word.startswith('2') and len(word) > 5 and word.isnumeric():
+                    word_val += 5
                 for new_model_id in new_model_ids:
                     if new_model_id in model_ids:
-                        model_ids[new_model_id] += 1
+                        model_ids[new_model_id] += word_val
                     else:
-                        model_ids[new_model_id] = 1
+                        model_ids[new_model_id] = word_val
         if model_ids:
             max_value = max(model_ids.values())
             model_ids = {k: v for k, v in model_ids.items() if v == max_value}
@@ -2706,11 +2796,28 @@ class AliChat(object):
             db_model, model_ids, response, table_bool, table_name)
         return response, html_response
 
+    def remove_stop_words_from_message(
+            self, message, db_model=None, other_db_model=None,
+            remove_punctuation=False):
+        if remove_punctuation:
+            message = re.sub(r'[^\w\s]', '', message)
+        stop_words = self.stop_words.copy()
+        if db_model:
+            stop_words += db_model.get_model_name_list()
+            if hasattr(db_model, 'get_model_omit_search_list'):
+                stop_words += db_model.get_model_omit_search_list()
+        if other_db_model:
+            stop_words += other_db_model.get_name_list()
+        words = utl.lower_words_from_str(message)
+        words = [x for x in words if x not in stop_words]
+        return words
+
     def search_db_models(self, db_model, message, response, html_response):
         response = ''
         html_response = ''
         model_ids, words = self.find_db_model(db_model, message)
         if model_ids:
+            words = self.remove_stop_words_from_message(message, db_model)
             response, html_response = self.search_db_model_from_ids(
                 db_model, words, model_ids)
         return response, html_response
@@ -2724,40 +2831,47 @@ class AliChat(object):
 
     @staticmethod
     def get_parent_for_db_model(db_model, words):
+        g_parent = None
+        gg_parent = None
         parent = db_model.get_parent()
-        g_parent = parent.get_parent()
-        gg_parent = g_parent.get_parent()
+        if hasattr(parent, 'get_parent'):
+            g_parent = parent.get_parent()
+        if g_parent and hasattr(g_parent, 'get_parent'):
+            gg_parent = g_parent.get_parent()
+        parent_models = [x for x in [gg_parent, g_parent, parent] if x]
         prev_model = None
-        for parent_model in [gg_parent, g_parent, parent]:
+        for parent_model in parent_models:
             model_name_list = parent_model.get_model_name_list()
             name = utl.get_next_value_from_list(words, model_name_list)
             if not name:
                 name_list = parent_model.get_name_list()
-                name = utl.get_dict_values_from_list(words, name_list, True)
-                if name:
-                    name = [name[0][next(iter(name[0]))]]
-                else:
-                    name = parent_model.get_default_name()
+                if name_list:
+                    name = utl.get_dict_values_from_list(words, name_list, True)
+                    if name:
+                        name = [name[0][next(iter(name[0]))]]
+            if not name:
+                name = parent_model.get_default_name()
             new_model = parent_model()
             new_model.set_from_form({'name': name[0]}, prev_model)
             new_model = new_model.check_and_add()
             prev_model = new_model
         return prev_model
 
-    @staticmethod
-    def check_gg_children(words, new_g_child, total_db=pd.DataFrame()):
+    def check_gg_children(self, words, new_g_child, total_db=pd.DataFrame()):
         r = ''
         new_model = new_g_child.get_children()
         if new_model:
-            stop_words = list(nltk.corpus.stopwords.words('english'))
-            words = [x for x in words if x not in stop_words or x == 'y']
-            r = new_model.check_col_in_words(new_model, words, new_g_child.id,
-                                             total_db=total_db)
-            new_model.create_from_rules(new_model, new_g_child.id)
+            r = 'Checking rules/placements for {}.  '.format(new_g_child.name)
+            words = [x for x in words if x not in self.stop_words or x == 'y']
+            new_model.check_gg_children(new_model, new_g_child.id, words,
+                                        total_db, r, message=self.message,
+                                        running_user_id=self.current_user.id)
         return r
 
     def create_db_model_children(self, cur_model, words):
         response = ''
+        if not cur_model:
+            return response
         db_model_child = cur_model.get_children()
         if not db_model_child:
             return response
@@ -2773,6 +2887,7 @@ class AliChat(object):
             self.db.session.commit()
             msg = 'The {} is named {}.  '.format(
                 db_model_child.__name__, child_name[0])
+            self.check_db_model_col(db_model_child, words, new_child)
             response += msg
         else:
             new_child = [x for x in cur_children if x.name in words]
@@ -2780,22 +2895,45 @@ class AliChat(object):
                 new_child = cur_children
             new_child = new_child[0]
         db_model_g_child = new_child.get_children()
+        cur_g_children = new_child.get_current_children()
         partner_list, partner_type_list = db_model_g_child.get_name_list()
         p_list = utl.get_dict_values_from_list(words, partner_list, True)
-        if p_list:
-            response += '{}(s) added '.format(db_model_g_child.__name__)
+        part_add_msg = '{}(s) added '.format(db_model_g_child.__name__)
+        lower_p_list = [x[next(iter(x))].lower() for x in p_list]
+        new_g_children = []
+        brand_new_ids = []
         for g_child in p_list:
+            is_new = False
             g_child_name = g_child[next(iter(g_child))]
             lower_name = g_child_name.lower()
-            cost = utl.get_next_number_from_list(
-                words, lower_name, cur_model.name)
-            g_child['total_budget'] = cost
-            new_g_child = db_model_g_child()
-            new_g_child.set_from_form(g_child, new_child)
-            self.db.session.add(new_g_child)
-            self.db.session.commit()
-            response += '{} ({}) '.format(g_child_name, cost)
-            response += self.check_gg_children(words, new_g_child)
+            new_g_child = [
+                x for x in cur_g_children if x.name.lower() == lower_name]
+            if new_g_child:
+                new_g_child = new_g_child[0]
+            else:
+                is_new = True
+                words_cost = words[words.index(lower_name):]
+                idx = len(words_cost)
+                for idx, x in enumerate(words_cost):
+                    if x in lower_p_list and idx != 0:
+                        break
+                words_cost = words_cost[:idx]
+                cost = utl.get_next_number_from_list(
+                    words_cost, lower_name, cur_model.name, last_instance=True)
+                g_child['total_budget'] = cost
+                new_g_child = db_model_g_child()
+                new_g_child.set_from_form(g_child, new_child)
+                self.db.session.add(new_g_child)
+                self.db.session.commit()
+                if part_add_msg not in response:
+                    response += part_add_msg
+                response += '{} ({}) '.format(g_child_name, cost)
+            self.check_db_model_col(db_model_g_child, words, new_g_child)
+            new_g_children.append(new_g_child.id)
+            if is_new:
+                brand_new_ids.append(new_g_child.id)
+        cur_model.launch_placement_task(new_g_children, words, self.message,
+                                        brand_new_ids=brand_new_ids)
         return response
 
     def create_db_model_from_other(self, db_model, message, other_db_model):
@@ -2811,13 +2949,15 @@ class AliChat(object):
                 self.db.session.add(new_model)
                 self.db.session.commit()
             cur_model_dict = cur_model.to_dict()
-            for k in list(db_model.__table__.columns):
+            for k in list(new_model.__table__.columns):
                 col = k.name
-                if col in other_db_model.__dict__.keys() and col != 'id':
+                if col in cur_model_dict.keys() and col != 'id':
                     v = cur_model_dict[col]
                     setattr(new_model, col, v)
             self.db.session.commit()
             args = new_model.get_create_args_from_other(cur_model)
+            if self.current_user:
+                args.append(self.current_user.id)
             new_model.create_object(*args)
             return new_model
 
@@ -2838,7 +2978,8 @@ class AliChat(object):
                 if db_model_post_from:
                     break
         model_ids, words = self.find_db_model(db_model, message)
-        if not model_ids or db_model_post_from != db_model:
+        if not model_ids or (
+                db_model_post_from and db_model_post_from != db_model):
             hold = other_db_model
             other_db_model = db_model
             db_model = hold
@@ -2859,8 +3000,7 @@ class AliChat(object):
                     db_model, message, other_db_model)
                 db_model = other_db_model
             else:
-                name_words = ['named', 'called', 'name', 'title']
-                name = utl.get_next_value_from_list(words, name_words)
+                name = utl.get_next_values_from_list(words)
                 if not name:
                     name = [self.current_user.username]
                 parent_model = self.get_parent_for_db_model(db_model, words)
@@ -2870,7 +3010,8 @@ class AliChat(object):
                                         self.current_user.id)
                 self.db.session.add(new_model)
                 self.db.session.commit()
-            response = self.create_db_model_children(new_model, words)
+            response = self.check_db_model_col(db_model, words, new_model)
+            response += self.create_db_model_children(new_model, words)
             response = '{}{}'.format(self.create_success_msg, response)
             if hasattr(new_model, 'get_create_prompt'):
                 post_create = new_model.get_create_prompt()
@@ -2884,32 +3025,51 @@ class AliChat(object):
         if not omit_list:
             omit_list = []
         match_col_dict = {}
-        stop_words = list(nltk.corpus.stopwords.words('english'))
         for k in db_model.__table__.columns:
             if k.name == 'id' or k.foreign_keys:
                 continue
             check_words = re.split(r'[_\s]|(?<=[a-z])(?=[A-Z])', k.name)
-            check_words = [x for x in check_words if x and x not in stop_words]
+            check_words = [x for x in check_words
+                           if x and x not in self.stop_words]
             in_list = utl.is_list_in_list(check_words, words, True, True)
             if in_list:
                 match_col_dict[k.name] = in_list
+        keys = []
         lengths = {k: len(v) for k, v in match_col_dict.items()}
-        max_length = max(lengths.values())
-        keys = [k for k, v in lengths.items() if v == max_length]
+        if lengths:
+            max_length = max(lengths.values())
+            keys = [k for k, v in lengths.items() if v == max_length]
+        if hasattr(db_model, 'get_omit_cols'):
+            keys = [x for x in keys if x not in db_model.get_omit_cols()]
         for k in keys:
             if k in words:
                 in_list = [k]
             else:
                 in_list = match_col_dict[k]
+                in_list = [x for x in in_list if x in words]
+            if not in_list:
+                continue
             pw = words[words.index(in_list[-1]) + 1:]
-            skip_words = [cur_model.name.lower()] + omit_list + stop_words
+            if pw and pw[0] in ['is']:
+                pw = pw[1:]
+            skip_words = [cur_model.name.lower()] + omit_list + self.stop_words
             pw = [x for x in pw if x not in skip_words]
-            new_val = re.split('[?.,]', ' '.join(pw))[0].rstrip()
-            setattr(cur_model, k, new_val)
-            self.db.session.commit()
-            response = 'The {} for {} was changed to {}'.format(
-                k, cur_model.name, new_val)
-            break
+            if 'date' in k:
+                new_val = pw[0]
+                if pw[1] in ['/', '-']:
+                    new_val = ''.join(pw[x] for x in range(5))
+                new_val = utl.string_to_date(new_val)
+            else:
+                new_val = re.split('[?.,]', ' '.join(pw))[0].rstrip()
+            if any(x in k for x in ['cost', 'budget']):
+                new_val = utl.get_next_number_from_list(
+                    words, k, cur_model.name, last_instance=True)
+            if new_val:
+                setattr(cur_model, k, new_val)
+                self.db.session.commit()
+                response += 'The {} for {} was changed to {}.  '.format(
+                    k, cur_model.name, new_val)
+                words = [x for x in words if x not in in_list]
         return response
 
     def check_children_for_edit(self, cur_model, words):
@@ -2937,8 +3097,7 @@ class AliChat(object):
                         break
         if not response:
             response = self.check_db_model_col(cur_model, words, cur_model)
-        if not response:
-            response = self.create_db_model_children(cur_model, words)
+        response += self.create_db_model_children(cur_model, words)
         return response
 
     def edit_db_model(self, db_model, words, model_ids):
@@ -2993,11 +3152,20 @@ class AliChat(object):
                 message, self.openai_found)
         return response, html_response
 
+    @staticmethod
+    def get_stop_words():
+        nltk.download('stopwords')
+        stop_words = list(nltk.corpus.stopwords.words('english'))
+        return stop_words
+
     def get_response(self, message, models_to_search=None, db=None,
                      current_user=None):
         self.db = db
         self.current_user = current_user
         self.models_to_search = models_to_search
+        self.message = message
+        if not self.stop_words:
+            self.stop_words = self.get_stop_words()
         response, html_response = self.check_if_openai_message(message)
         if not response and models_to_search:
             for db_model in models_to_search:

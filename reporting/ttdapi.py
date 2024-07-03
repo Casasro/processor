@@ -6,9 +6,11 @@ import logging
 import requests
 import pandas as pd
 import reporting.utils as utl
+import reporting.vmcolumns as vmc
 
 
-url = 'https://api.thetradedesk.com/v3'
+ttd_url = 'https://api.thetradedesk.com/v3'
+walmart_url = 'https://api.dsp.walmart.com/v3'
 configpath = utl.config_path
 
 
@@ -52,6 +54,7 @@ class TtdApi(object):
                 sys.exit(0)
 
     def authenticate(self):
+        url = self.walmart_check()
         auth_url = "{0}/authentication".format(url)
         userpass = {'Login': self.login, 'Password': self.password}
         self.headers = {'Content-Type': 'application/json'}
@@ -63,11 +66,15 @@ class TtdApi(object):
         auth_token = json.loads(r.text)['Token']
         return auth_token
 
-    def get_download_url(self):
+    def set_headers(self):
         auth_token = self.authenticate()
-        rep_url = '{0}/myreports/reportexecution/query/advertisers'.format(url)
         self.headers = {'Content-Type': 'application/json',
                         'TTD-Auth': auth_token}
+
+    def get_download_url(self):
+        self.set_headers()
+        url = self.walmart_check()
+        rep_url = '{0}/myreports/reportexecution/query/advertisers'.format(url)
         data = []
         i = 0
         error_response_count = 0
@@ -98,7 +105,11 @@ class TtdApi(object):
                 logging.warning('Retrying.  Unknown response :'
                                 '{}'.format(raw_data))
                 error_response_count = self.response_error(error_response_count)
-        last_completed = max(data, key=lambda x: x['ReportEndDateExclusive'])
+        try:
+            last_completed = max(data, key=lambda x: x['ReportEndDateExclusive'])
+        except ValueError as e:
+            logging.warning('Report does not contain any data: {}'.format(e))
+            return None
         dl_url = last_completed['ReportDeliveries'][0]['DownloadURL']
         return dl_url
 
@@ -123,6 +134,165 @@ class TtdApi(object):
     def get_data(self, sd=None, ed=None, fields=None):
         logging.info('Getting TTD data for: {}'.format(self.report_name))
         dl_url = self.get_download_url()
+        if dl_url is None:
+            logging.warning('Could not retrieve url, returning blank df.')
+            return pd.DataFrame()
         r = requests.get(dl_url, headers=self.headers)
         self.df = self.get_df_from_response(r)
         return self.df
+
+    def check_partner_id(self):
+        self.set_headers()
+        url = self.walmart_check()
+        rep_url = '{0}/partner/query'.format(url)
+        i = 0
+        error_response_count = 0
+        partner_id = None
+        for i in range(5):
+            if partner_id or error_response_count >= 5:
+                break
+            payload = {
+                'searchTerms': [],
+                'PageStartIndex': i * 99,
+                'PageSize': 100
+            }
+            r = requests.post(rep_url, headers=self.headers, json=payload)
+            raw_data = json.loads(r.content)
+            if 'Result' in raw_data:
+                partner_id = raw_data['Result'][0]['PartnerId']
+            elif ('Message' in raw_data and
+                  raw_data['Message'] == 'Too Many Requests'):
+                logging.warning('Rate limit exceeded, '
+                                'pausing for 5s: {}'.format(raw_data))
+                time.sleep(5)
+                error_response_count = self.response_error(
+                    error_response_count)
+            else:
+                logging.warning('Retrying.  Unknown response :'
+                                '{}'.format(raw_data))
+                error_response_count = self.response_error(
+                    error_response_count)
+        return partner_id
+
+    def check_advertiser_id(self, results, acc_col, success_msg, failure_msg):
+        self.set_headers()
+        url = self.walmart_check()
+        rep_url = '{0}/advertiser/query/partner'.format(url)
+        i = 0
+        error_response_count = 0
+        check_advertiser_id = ""
+        partner_id = self.check_partner_id()
+        r = None
+        for i in range(5):
+            payload = {
+                'partnerId': partner_id,
+                'PageStartIndex': i * 99,
+                'PageSize': 100
+            }
+            r = requests.post(rep_url, headers=self.headers, json=payload)
+            raw_data = json.loads(r.content)
+            if 'Result' in raw_data:
+                result_list = raw_data['Result']
+                df = pd.DataFrame(data=result_list)
+                check_advertiser_id = df['AdvertiserId'].eq(self.ad_id).any()
+                if check_advertiser_id:
+                    check_advertiser_id = self.ad_id
+                break
+            elif ('Message' in raw_data and
+                  raw_data['Message'] == 'Too Many Requests'):
+                logging.warning('Rate limit exceeded, '
+                                'pausing for 5s: {}'.format(raw_data))
+                time.sleep(5)
+                error_response_count = self.response_error(
+                    error_response_count)
+            else:
+                logging.warning('Retrying.  Unknown response :'
+                                '{}'.format(raw_data))
+                error_response_count = self.response_error(
+                    error_response_count)
+        if check_advertiser_id:
+            row = [acc_col, ' '.join([success_msg, str(self.ad_id)]),
+                   True]
+            results.append(row)
+        else:
+            msg = ('Advertiser ID NOT Found. '
+                   'Double Check ID and Ensure Permissions were granted.'
+                   '\n Error Msg:')
+            r = r.json()
+            row = [acc_col, ' '.join([failure_msg, msg]), False]
+            results.append(row)
+        return results, r
+
+    def check_reports_id(self, results, acc_col, success_msg, failure_msg):
+        self.set_headers()
+        url = self.walmart_check()
+        rep_url = '{0}/myreports/reportschedule/query'.format(url)
+        i = 0
+        error_response_count = 0
+        check_reports_id = ""
+        r = None
+        for i in range(5):
+            if check_reports_id or error_response_count >= 5:
+                break
+            payload = {
+                'sortFields': [],
+                'PageStartIndex': i * 99,
+                'NameContains': self.report_name,
+                'PageSize': 100
+            }
+            r = requests.post(rep_url, headers=self.headers, json=payload)
+            raw_data = json.loads(r.content)
+            if 'Result' in raw_data:
+                result_list = raw_data['Result']
+                df = pd.DataFrame(data=result_list)
+                if not df.empty:
+                    if 'ReportScheduleName' in df.columns:
+                        check_reports_id = \
+                            df['ReportScheduleName'].eq(self.report_name).any()
+                        if check_reports_id:
+                            check_reports_id = self.report_name
+                        break
+            elif ('Result' in raw_data and
+                  raw_data['Message'] == 'Too Many Requests'):
+                logging.warning('Rate limit exceeded, '
+                                'pausing for 5s: {}'.format(raw_data))
+                time.sleep(5)
+                error_response_count = self.response_error(
+                    error_response_count)
+            else:
+                logging.warning('Retrying.  Unknown response :'
+                                '{}'.format(raw_data))
+                error_response_count = self.response_error(
+                    error_response_count)
+        if check_reports_id:
+            row = [acc_col, ' '.join([success_msg, str(self.report_name)]),
+                   True]
+            results.append(row)
+        else:
+            msg = ('Report Name NOT Found.'
+                   'Double Check name and Ensure Permissions were granted.'
+                   '\n Error Msg:')
+            r = r.json()
+            row = [acc_col, ' '.join([failure_msg, msg]), False]
+            results.append(row)
+        return results, r
+
+    def test_connection(self, acc_col, camp_col, acc_pre):
+        success_msg = 'SUCCESS:'
+        failure_msg = 'FAILURE:'
+        self.set_headers()
+        results, r = self.check_advertiser_id(
+            [], acc_col, success_msg, failure_msg)
+        if False in results[0]:
+            return pd.DataFrame(data=results, columns=vmc.r_cols[:2])
+        results = self.check_reports_id(
+            results, camp_col, success_msg, failure_msg)
+        return pd.DataFrame(data=results, columns=vmc.r_cols[:2])
+
+    def walmart_check(self):
+        if 'ttd_api' not in self.login and 'wmt_api' in self.login:
+            url = walmart_url
+        else:
+            url = ttd_url
+        return url
+
